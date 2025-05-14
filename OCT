@@ -1,0 +1,296 @@
+import numpy as np
+import gurobipy as gp
+import math
+
+from gurobipy import GRB
+from sklearn import tree
+from collections import namedtuple
+from spicy import stats
+
+
+class OCT:
+    """
+    optimal classification tree
+    """
+    def __init__(self, max_depth, min_samples_leaf, alpha, warmstart=False, timelimit=900, output=True):
+        self.max_depth = max_depth
+        self.min_samples_leaf = min_samples_leaf  
+        self.alpha = alpha
+        self.warmstart = warmstart
+        self.timelimit = timelimit
+        self.output = output
+        self.trained = False
+        self.optgap = None
+
+    # INDEXING THE NODES, BRANCH NODES AND LEAF NODES
+        self.index_nodes = [t+1 for t in range(2**(max_depth + 1) - 1)]
+        self.index_branch_nodes = [t+1 for t in range(math.floor(max(self.index_nodes)/2))]
+        self.index_leaf_nodes = [t+1 for t in range(math.floor(max(self.index_nodes)/2), max(self.index_nodes))]
+
+    def fit(self, x, y):
+        """
+        fitting the training data
+        """
+        # DATA SIZE
+        self.n, self.p = x.shape
+        if self.output:
+            print('Training data include {} instances and {} features'.format(self.n,self.p))
+
+        self.labels = np.unique(y)         
+
+        # SCALES THE DATA
+        self.scales = np.max(x, axis = 0)     
+        self.scales[self.scales == 0] = 1      
+
+        # SOLVE MIP
+        m, a, b, c, d, z, l = self._buildMIP(x/self.scales, y)
+        if self.warmstart:
+            self._setStart(x, y, a, c, d, l)
+        m.optimize()
+        self.optgap = m.MIPGap             
+
+        # GET PARAMETERS
+
+        self._a = {ind: a[ind].x for ind in a}
+        self._b = {ind: b[ind].x for ind in b}
+        self._c = {ind: c[ind].x for ind in c}
+        self._d = {ind: d[ind].x for ind in d}
+        self._z = {ind: z[ind].x for ind in z}
+        self._l = {ind: l[ind].x for ind in l}
+
+        self.trained = True
+
+    def predict(self, x):
+        if not self.trained:
+            raise AssertionError('This OptimalDecisionTreeClassifier instance is not fitted yet.')
+
+        labelmap = {}                        
+        for t in self.index_leaf_nodes:       
+            for k in self.labels:               
+                if self._c[k,t] >= 1e-2:       
+                    labelmap[t] = k
+
+        y_pred = []
+        for x_i in x/self.scales:               
+            t = 1                          
+            while t not in self.index_leaf_nodes:   
+                right = (sum([self._a[j,t] * x_i[j] for j in range(self.p)]) + 1e-9 >= self._b[t])
+                if right:
+                    t = 2 * t + 1                # IF THE DATAPOINT FOLLOWS THE RIGHT BRANCH, THEN t IS INDEXED WITH THE RIGHT CHILD NODE
+                else:
+                    t = 2 * t                   # OTHERWISE IT IS INDEXED ON THE LEFT CHILD NODE
+            y_pred.append(labelmap[t])          # WHEN A LEAF NODE t IS REACHED, x_i IS ASSIGNED ITS PREDICTED CLASS
+        return np.array(y_pred)
+
+    # USING THE GUROBI SOLVER TO BUILD THE MIP
+    def _buildMIP(self, x, y):
+        m = gp.Model()
+
+        m.Params.outputFlag = self.output
+        m.Params.LogToConsole = self.output
+        m.Params.timelimit = self.timelimit  
+        m.params.threads = 0
+
+        # STATE THE VARIABLES
+        a = m.addVars(self.p, self.index_branch_nodes, vtype=GRB.BINARY, name='a')
+        b = m.addVars(self.index_branch_nodes, vtype=GRB.CONTINUOUS, name='b')
+        d = m.addVars(self.index_branch_nodes, vtype=GRB.BINARY, name='d')
+        z = m.addVars(self.n, self.index_leaf_nodes, vtype = GRB.BINARY, name='z')
+        l = m.addVars(self.index_leaf_nodes, vtype = GRB.BINARY, name='l')
+        N = m.addVars(self.labels, self.index_leaf_nodes, vtype = GRB.CONTINUOUS, name='Nkt')
+        Nt = m.addVars(self.index_leaf_nodes, vtype = GRB.CONTINUOUS, name='Nt')
+        c = m.addVars(self.labels, self.index_leaf_nodes, vtype = GRB.BINARY, name='c')
+        L = m.addVars(self.index_leaf_nodes, vtype = GRB.CONTINUOUS, name='l')
+
+        # BASELINE ACCURACY
+        L_hat = self._baseline(y)                   # BASELINE ACCURACY
+
+        epsilon = self._epsilon(x)                  # EPSILON USED IN THE CONSTRAINS
+
+        # MINIMIZE OBJECT FUNCTION
+        obj = L.sum() / L_hat + self.alpha * d.sum()
+        m.setObjective(obj, GRB.MINIMIZE)
+
+        # ADDING CONSTRAINS
+        m.addConstrs(a.sum('*',t) == d[t] for t in self.index_branch_nodes)
+
+        m.addConstrs(b[t] <= d[t] for t in self.index_branch_nodes)
+
+        m.addConstrs(d[t] <= d[t//2] for t in self.index_branch_nodes if t != 1)
+
+        m.addConstrs(z[i,t] <= l[t] for t in self.index_leaf_nodes for i in range(self.n))
+
+        m.addConstrs(z.sum('*',t) >= self.min_samples_leaf * l[t] for t in self.index_leaf_nodes)
+
+        m.addConstrs(z.sum(i,'*') == 1 for i in range(self.n))
+
+        for t in self.index_leaf_nodes:
+            left = (t % 2 == 0)
+            t_par = t // 2
+            while t_par != 0:
+                if left:
+                    m.addConstrs(gp.quicksum(a[j,t_par] * (x[i,j] + epsilon[j]) for j in range(self.p))
+                                 + (1 + np.max(epsilon)) * (1 - d[t_par])
+                                 <= b[t_par] + (1 + np.max(epsilon)) * (1 - z[i,t]) for i in range(self.n))
+                else:
+                    m.addConstrs(gp.quicksum(a[j,t_par] * x[i,j] for j in range(self.p))
+                                 >= b[t_par] - (1 - z[i,t]) for i in range(self.n))
+                left = (t_par % 2 == 0)
+                t_par //=2
+
+        m.addConstrs(gp.quicksum((y[i] == k)*z[i,t] for i in range(self.n)) == N[k,t] for t in self.index_leaf_nodes for k in self.labels)
+
+        m.addConstrs(z.sum('*',t) == Nt[t] for t in self.index_leaf_nodes)
+
+        m.addConstrs(c.sum('*',t) == l[t] for t in self.index_leaf_nodes)
+
+        m.addConstrs(L[t] >= Nt[t] - N[k,t] - self.n * (1 - c[k,t]) for t in self.index_leaf_nodes for k in self.labels)
+
+        m.addConstrs(L[t] <= Nt[t] - N[k,t] + self.n * c[k,t] for t in self.index_leaf_nodes for k in self.labels)
+
+        return m, a, b, c, d, z, l
+
+    @staticmethod
+    def _baseline(y):
+        mode = stats.mode(y)[0]
+        return np.sum(y == mode)
+
+    def _epsilon(self, x):
+        epsilon = []
+        for j in range(self.p):
+            x_j = x[:,j]
+            x_j = np.unique(x_j)
+            x_j = np.sort(x_j)[::-1]
+            dis = [1]
+            for i in range(len(x_j) - 1):
+                dis.append(x_j[i] - x_j[i+1])
+            epsilon.append(np.min(dis) if np.min(dis) else 1)
+        return epsilon
+
+    def _setStart(self, x, y, a, c, d, l):
+        """
+        Warm start from CART
+        """
+        # TRAIN WITH CART
+        if self.min_samples_leaf > 1:
+            clf = tree.DecisionTreeClassifier(max_depth=self.max_depth, min_samples_leaf=self.min_samples_leaf)
+        else:
+            clf = tree.DecisionTreeClassifier(max_depth=self.max_depth)
+        clf.fit(x, y)
+
+        # SPLITTING RULES
+        rules = self._getRules(clf)
+
+        # BRANCH NODES
+        for t in self.index_branch_nodes:
+            if rules[t].feat is None or rules[t].feat == tree._tree.TREE_UNDEFINED:
+                d[t].start = 0                                   
+                for j in range(self.p):
+                    a[j,t].start = 0
+            else:
+                d[t].start = 1                                   
+                for j in range(self.p):
+                    if j == int(rules[t].feat):
+                        a[j,t].start = 1                          
+                    else:
+                        a[j, t].start = 0                       
+
+        # LEAF NODES
+        for t in self.index_leaf_nodes:
+            if rules[t].value is None:
+                l[t].start = int(t % 2)
+                if t % 2:
+                    t_leaf = t
+                    while rules[t].value is None:
+                        t //= 2
+                    for k in self.labels:
+                        if k == np.argmax(rules[t].value):
+                            c[k,t_leaf].start = 1
+                        else:
+                            c[k, t_leaf].start = 0
+                else:
+                    for k in self.labels:
+                        c[k,t].start = 0
+            else:
+                l[t].start = 1
+                for k in self.labels:
+                    if k == np.argmax(rules[t].value):
+                        c[k,t].start = 1
+                    else:
+                        c[k,t].start = 0
+
+    def _getRules(self, clf):
+        """
+        Splitting rules
+        """
+        node_map = {1:0}
+        for t in self.index_branch_nodes:
+            # TERMINAL NODE
+            node_map[2*t] = -1
+            node_map[2*t+1] = -1
+            # LEFT
+            l = clf.tree_.children_left[node_map[t]]
+            node_map[2*t] = l
+            # RIGHT
+            r = clf.tree_.children_right[node_map[t]]
+            node_map[2*t+1] = r
+
+        # RULES
+        rule = namedtuple('Rules', ('feat', 'threshold', 'value'))
+        rules = {}
+        # BRANCH NODES
+        for t in self.index_branch_nodes:
+            i = node_map[t]
+            if i == -1:
+                r = rule(None, None, None)
+            else:
+                r = rule(clf.tree_.feature[i], clf.tree_.threshold[i], clf.tree_.value[i, 0])
+            rules[t] = r
+
+        # LEAF NODES
+        for t in self.index_leaf_nodes:
+            i = node_map[t]
+            if i == -1:
+                r = rule(None, None, None)
+            else:
+                r = rule(None, None, clf.tree_.value[i, 0])
+            rules[t] = r
+
+        return rules
+
+    def get_classification_tree(self):
+        if not self.trained:
+            raise AssertionError('Model is not trained yet.')
+
+        def extract_node_info(node_idx):
+            if node_idx in self.index_leaf_nodes:
+                for k in self.labels:
+                    if self._c[k, node_idx] >= 1e-2:  # If c_kt > 0, this node is assigned to class k
+                        return f"Leaf node {node_idx}: Predicted class {k}"
+
+            else:
+                left_node = 2 * node_idx
+                right_node = 2 * node_idx + 1
+                feature_split = None
+                threshold_split = None
+
+                for j in range(self.p):
+                    if self._a[j, node_idx] > 0:  # If a_ij > 0, this feature j is the splitting feature
+                        feature_split = j
+                        threshold_split = self._b[node_idx]
+                        break
+
+                if feature_split is not None:
+                    # If a split exists, return the rule and recursively get the child nodes
+                    left_child = extract_node_info(left_node)
+                    right_child = extract_node_info(right_node)
+
+                    return (f"Node {node_idx}: Split on Feature {feature_split} < {threshold_split}\n"
+                            f"  Left child: {left_child}\n"
+                            f"  Right child: {right_child}")
+                else:
+                    return f"Node {node_idx}: No valid split, treated as leaf node"
+
+        # Start with the root node (node 1) and recursively extract its information
+        tree_structure = extract_node_info(1)
+        return tree_structure
