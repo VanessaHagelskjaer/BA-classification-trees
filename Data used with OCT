@@ -1,0 +1,54 @@
+import pandas as pd
+import numpy as np
+
+url_performance = "https://archive.ics.uci.edu/static/public/891/data.csv"
+
+col_names = ["ID",
+             "Diabetes",
+             "BP",
+             "Cholesterol",
+             "CholesterolCheck",
+             "BMI",
+             "Smoker",
+             "Stroke",
+             "HeartAttack",
+             "PhysActivity",
+             "Fruits",
+             "Vegetables",
+             "AlcoholConsumption",
+             "HealthcareCoverage",
+             "NoDocBcCost",
+             "GeneralHealth",
+             "MentalHealth",
+             "PhysicalHealth",
+             "DifficultyWalking",
+             "Gender",
+             "Age",
+             "Education",
+             "Income"]
+
+
+df = pd.read_csv(url_performance, skiprows = 1, names = col_names)
+
+df_0 = df.sample(n = 200, random_state = 42)
+
+df_1 = df_0.drop(["ID"], axis = 1)
+
+t = {(1,2):0, (3,4):1, (5,6):2, (7,8):3, (9,10):4, (11,12):5, (13):6}
+df_1['Age'] = df_1['Age'].replace(t)
+
+u = {(1):0, (2):1, (3):2, (4):3, (5):4, (6):5}
+df_1['Education'] = df_1['Education'].replace(u)
+
+v = {(1):0, (2,3,4,5):1, (6,7):2, (8):3}
+df_1['Income'] = df_1['Income'].replace(v)
+
+datapoints = (df_1.drop(["Diabetes"], axis = 1))
+test_datapoints = datapoints.to_numpy()
+
+target = df_1["Diabetes"]
+test_target = target.to_numpy()
+
+class_labels, XX = np.unique(df_1['Diabetes'], return_inverse=True)
+
+X_train, X_test, Y_train, Y_test = train_test_split(test_datapoints, test_target, train_size=0.5, random_state=42)
