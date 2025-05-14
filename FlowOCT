@@ -1,0 +1,240 @@
+import numpy as np
+import gurobipy as gp
+
+from gurobipy import GRB
+from collections import Counter
+from spicy import stats
+
+class FlowTreeClassifier:
+
+    def __init__(self, max_depth, timelimit = 900, output = True):
+        self.max_depth = max_depth
+        self.timelimit = timelimit
+        self.output = output
+        self.trained = False
+        self.optgap = None
+
+        #NODES OF THE TREE
+        self.index_nodes = [t + 1 for t in range(2 ** (self.max_depth + 1) - 1)]
+        self.index_branch_nodes = [t + 1 for t in range(2 ** self.max_depth - 1)]
+        self.index_leaf_nodes = [t + 1 for t in range(2 ** self.max_depth - 1, 2 ** (self.max_depth + 1) - 1)]
+
+    def generate_tree(self):
+        edges = []
+        inner_edges = []
+        a = []
+        s = []
+        le = []
+        r = []
+        t = []
+
+        index_nodes = [t + 1 for t in range(2 ** (self.max_depth + 1) - 1)]
+        index_branch_nodes = [t + 1 for t in range(2 ** self.max_depth - 1)]
+        index_leaf_nodes = [t + 1 for t in range(2 ** self.max_depth - 1, 2 ** (self.max_depth + 1) - 1)]
+
+
+        source = 0
+        root = 1
+        sink = max(index_nodes) + 1
+
+        for n in index_branch_nodes:
+            left = 2 * n
+            right = 2 * n + 1
+            if left <= len(index_branch_nodes) + len(index_leaf_nodes):
+                edges.append((n, left))
+                inner_edges.append((n,left))
+                le.append((n, left))
+                a.append((n, left))
+            if right <= len(index_branch_nodes) + len(index_leaf_nodes):
+                edges.append((n, right))
+                inner_edges.append((n,right))
+                r.append((n,right))
+                a.append((n, right))
+
+        edges.append((source, root))
+        s.append((source, root))
+
+        for l in index_leaf_nodes:
+            edges.append((l, sink))
+            t.append((l, sink))
+
+        a.append((0,1))
+
+        self.edges = edges
+        self.inner_edges = inner_edges
+        self.a = a
+        self.t = t
+        self.le = le
+        self.r = r
+        self.s = s
+
+        return {
+            "edges": self.edges,
+            "inner_edges": self.inner_edges,
+            "a(n)": self.a,
+            "l(n)": self.le,
+            "r(n)": self.r,
+            "t": self.t,
+            "s": self.s,
+            "branch_nodes": self.index_branch_nodes,
+            "leaf_nodes": self.index_leaf_nodes,
+            "source": source,
+            "root": root,
+            "sink": sink
+        }
+
+    def fit(self, x, y):
+        self.n , self.p = x.shape
+
+        self.labels = [int(label) for label in np.unique(y)]
+
+        self.generate_tree()
+
+        m, b, za, zn, w = self._buildMIP(x, y)
+        m.optimize()
+
+        print("Za values:", {key: za[key].x for key in za if za[key].x == 1})
+        print("Zn values:", {key: zn[key].x for key in zn if zn[key].x == 1})
+        print("W values:", {key: w[key].x for key in w if w[key].x == 1})
+        print("b values:", {key: b[key].x for key in b if b[key].x == 0})
+        print("b values:", {key: b[key].x for key in b if b[key].x == 1})
+        self.optgap = m.MIPGap
+
+        self._b = {ind: b[ind].x for ind in b}
+        self._za = {ind: za[ind].x for ind in za}
+        self._zn = {ind: zn[ind].x for ind in zn}
+        self._w = {ind: w[ind].x for ind in w}
+
+        self.trained = True
+
+    def predict(self, x):
+        if not self.trained:
+            raise ValueError("Model is not trained yet.")
+
+        x = np.array(x)
+        predictions = []
+        assigned_counts = Counter()
+
+        for i, x_i in enumerate(x):
+            node = 1
+
+            while node in self.index_branch_nodes:
+                for feature in range(self.p):
+                    if self._b.get((node, feature)) == 1:
+                        if x_i[feature] == 0:
+                            node = 2 * node
+                        else:
+                            node = 2 * node + 1
+                        break
+
+            if node in self.index_leaf_nodes:
+                for label in self.labels:
+                    if self._w.get((node, label)) == 1:
+                        predictions.append(label)
+                        assigned_counts[node] += 1
+                        break
+
+        print("\nTildelte bladnoder og deres antal:")
+        for node, count in assigned_counts.items():
+            print(f"Bladnode {node}: {count} datapunkter")
+
+        return np.array(predictions)
+
+    def _buildMIP(self, x, y):
+        m = gp.Model()
+
+        m.Params.outputFlag = self.output
+        m.Params.LogToConsole = self.output
+        m.Params.timelimit = self.timelimit
+        m.params.threads = 0
+
+        print("Branch nodes:", self.index_branch_nodes)
+        print("Edges:", self.edges)
+        print("a:", self.a)
+        print("Leaf nodes:", self.index_leaf_nodes)
+        print("Labels:", self.labels)
+        print("Shape x:", x.shape)
+
+        b = m.addVars(self.index_branch_nodes, self.p, vtype = GRB.BINARY, name = "b")
+        za = m.addVars([(i, a[0], a[1]) for i in range(self.n) for a in self.a], vtype = GRB.BINARY, name = "za")
+        zn = m.addVars([(i, e[0], e[1]) for i in range(self.n) for e in self.edges], vtype = GRB.BINARY, name = "zn")
+        w = m.addVars(self.index_leaf_nodes, self.labels, vtype = GRB.BINARY, name = "w")
+
+        print("za vars:", len(za))
+        print("zn vars:", len(zn))
+        print("w vars:", len(w))
+        print("b vars:", len(b))
+
+        L_hat = self._baseline(y)
+        print(L_hat)
+
+        obj1 = gp.quicksum(gp.quicksum(zn[i, k[0], k[1]] for k in self.t) for i in range(self.n))
+        obj = 1/L_hat*(self.n - obj1)
+        m.setObjective(obj, GRB.MINIMIZE)
+
+        m.addConstrs(gp.quicksum(b[n,f] for f in range(self.p)) == 1 for n in self.index_branch_nodes)
+
+        for n in self.index_branch_nodes:
+            left_arc = (n, 2 * n)
+            right_arc = (n, 2 * n + 1)
+            parent_arc = [arc for arc in self.a if arc[1] == n]
+            assert len(parent_arc) == 1
+            parent_arc = parent_arc[0]
+
+            m.addConstrs(za[i, parent_arc[0], parent_arc[1]]
+                         == za[i, left_arc[0], left_arc[1]] + za[i, right_arc[0], right_arc[1]] for i in range(self.n))
+
+        sink = max(self.index_nodes) + 1
+
+        for n in self.index_leaf_nodes:
+            sink_arc = (n, sink)
+            parent_arc = [arc for arc in self.a if arc[1] == n]
+            assert len(parent_arc) == 1
+            parent_arc = parent_arc[0]
+
+            m.addConstrs(za[i, parent_arc[0], parent_arc[1]] == zn[i, sink_arc[0], sink_arc[1]] for i in range(self.n))
+
+        m.addConstrs(zn[i, 0, 1] <= 1 for i in range(self.n))
+
+
+        for n in self.index_branch_nodes:
+            left_arc = (n, 2 * n)
+            right_arc = (n, 2 * n + 1)
+
+            m.addConstrs(za[i, left_arc[0], left_arc[1]] <= gp.quicksum(b[n, f] for f in range(self.p) if x[i,f] == 0)
+                         for i in range(self.n))
+
+            m.addConstrs(za[i, right_arc[0], right_arc[1]] <= gp.quicksum(b[n, f] for f in range(self.p) if x[i, f] == 1)
+                         for i in range(self.n))
+
+
+        for n in self.index_leaf_nodes:
+            sink_arc = (n, sink)
+
+            m.addConstrs(zn[i, sink_arc[0], sink_arc[1]] <= w[n, y[i]] for i in range(self.n))
+
+        m.addConstrs(gp.quicksum(w[n, k] for k in self.labels) == 1 for n in self.index_leaf_nodes)
+
+
+        return m, b, za, zn, w
+
+    def get_split_features(self, feature_names=None):
+        if not self.trained:
+            raise ValueError("Model is not trained yet.")
+
+        splits = {}
+        for (node, feature), value in self._b.items():
+            if value == 1:
+                name = feature_names[feature] if feature_names is not None else feature
+                splits[node] = name
+
+        return splits
+    @staticmethod
+    def _baseline(y):
+        mode = stats.mode(y)[0]
+        return np.sum(y == mode)
+
+
+
+
+
